@@ -1,0 +1,131 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+# Runner self-hosted chạy Linux x64 (pool ephemeral runners cohort3).
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Một token cho cả hai job. Tạo ở https://railway.com/account/tokens
+  # (loại "Project token" gắn với project VMEC-04 là đủ).
+  RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+jobs:
+  # Detect which app changed so a frontend-only commit does not redeploy the API.
+  changes:
+    runs-on: [self-hosted, linux, x64, cohort3]
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            api:
+              - 'backend/**'
+              - 'migrations/**'
+              - 'requirements.txt'
+              - 'alembic.ini'
+              - 'Dockerfile'
+              - 'railway.json'
+              - '.railwayignore'
+              - '.github/workflows/deploy.yml'
+            web:
+              - 'frontend/**'
+              - '.github/workflows/deploy.yml'
+
+  deploy-api:
+    needs: changes
+    if: needs.changes.outputs.api == 'true'
+    runs-on: [self-hosted, linux, x64, cohort3]
+    steps:
+      # Workspace của self-hosted runner giữ nguyên rác từ lần chạy trước:
+      # __pycache__ lọt vào bundle upload của `railway up`.
+      - name: Clean stale workspace artifacts
+        run: |
+          rm -rf .pytest_cache .ruff_cache
+          find . -path ./.git -prune -o -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+      - name: Verify runner toolchain
+        run: |
+          missing=""
+          for tool in git curl; do
+            command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Self-hosted runner thiếu:$missing. Cài sẵn trên máy rồi chạy lại."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      # Source upload + remote build — giống `railway up` chạy ở máy local.
+      # -c: stream build log rồi thoát; thiếu cờ này job treo ở log runtime.
+      # --service/--environment truyền thẳng nên runner không cần `railway link`.
+      - run: railway up -c --service "VMEC-04/BE" --environment production
+      - name: Smoke test
+        run: |
+          curl --fail --silent --show-error --max-time 30 \
+            https://vmec-04be-production.up.railway.app/api/v1/status
+
+  deploy-web:
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: [self-hosted, linux, x64, cohort3]
+    steps:
+      # node_modules và .next sót lại từ lần chạy trước bị `railway up` gói vào
+      # bundle upload, làm upload chậm và có thể lẫn build cũ vào image.
+      - name: Clean stale workspace artifacts
+        run: |
+          rm -rf frontend/node_modules frontend/.next
+
+      - name: Verify runner toolchain
+        run: |
+          missing=""
+          for tool in git curl; do
+            command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Self-hosted runner thiếu:$missing. Cài sẵn trên máy rồi chạy lại."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      # working-directory: frontend là BẮT BUỘC — `railway up` upload thư mục
+      # hiện tại. Chạy ở root sẽ upload cả repo và build Dockerfile của backend
+      # vào service frontend.
+      #
+      # Không có step build riêng: Dockerfile (frontend/Dockerfile) tự cài
+      # dependency và chạy `pnpm build` trên Railway. NEXT_PUBLIC_API_URL lấy từ
+      # service variable qua ARG, không phải từ env của runner.
+      - run: railway up -c --service "VMEC-04/FE" --environment production
+        working-directory: frontend
+      - name: Smoke test
+        run: |
+          curl --fail --silent --show-error --max-time 30 \
+            https://c3-app-067.up.railway.app > /dev/null
